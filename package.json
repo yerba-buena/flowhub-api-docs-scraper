@@ -1,0 +1,30 @@
+{
+  "name": "@yerba-buena/flowhub-api-docs-scraper",
+  "version": "2.0.0",
+  "description": "Scrape the Flowhub Stoplight developer portal into agent-ready Markdown and OpenAPI",
+  "main": "scrape.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "scrape": "node scrape.js",
+    "generate-spec": "node generate-spec.js",
+    "publish-docs": "bash publish.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yerba-buena/flowhub-api-docs-scraper"
+  },
+  "homepage": "https://github.com/yerba-buena/flowhub-api-docs-scraper",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "openapi-to-postmanv2": "^4.21.0",
+    "playwright": "^1.47.0",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2",
+    "yaml": "^2.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

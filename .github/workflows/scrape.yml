@@ -1,0 +1,62 @@
+name: Re-scrape Flowhub docs
+
+on:
+  schedule:
+    - cron: "0 13 * * 0"  # Sundays at 13:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout scraper
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Setup SSH for docs repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DOCS_REPO_DEPLOY_KEY }}
+
+      - name: Clone docs repo
+        run: |
+          git clone git@github.com:yerba-buena/flowhub-api-docs.git ../flowhub-api-docs
+          cd ../flowhub-api-docs
+          git config user.name "flowhub-docs-bot"
+          git config user.email "flowhub-docs-bot@users.noreply.github.com"
+
+      - name: Run scraper
+        env:
+          OUTPUT_DIR: ${{ github.workspace }}/../flowhub-api-docs
+        run: node scrape.js
+
+      - name: Generate OpenAPI / Postman exports
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DOCS_DIR: ${{ github.workspace }}/../flowhub-api-docs
+        run: node generate-spec.js
+
+      - name: Commit and push if changed
+        run: |
+          cd ../flowhub-api-docs
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "No changes."
+            exit 0
+          fi
+          TIMESTAMP="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          git add -A
+          git commit -m "Re-scrape: $TIMESTAMP (automated)"
+          git tag "snapshot-$(date -u +'%Y-%m-%d')" || true
+          git push
+          git push --tags || true
