@@ -133,6 +133,8 @@ async function discoverUrls(page) {
   await expandEverything(page);
   await sleep(500);
   await expandEverything(page);
+
+  // Phase 1: collect all <a href> links pointing to portal pages
   const urls = await page.evaluate((prefix) => {
     const out = new Set();
     document.querySelectorAll("a[href]").forEach((a) => {
@@ -145,8 +147,92 @@ async function discoverUrls(page) {
     });
     return Array.from(out);
   }, URL_PREFIX);
-  console.log(`[discover] found ${urls.length} sidebar links`);
-  return urls;
+  console.log(`[discover] found ${urls.length} top-level sidebar links`);
+
+  // Phase 2: visit each API page and discover nested sub-page links
+  // Stoplight Elements renders endpoint sidebars with clickable items
+  // that use client-side navigation — we need to click each one and
+  // capture the resulting URL from the address bar.
+  const nestedUrls = new Set();
+  const apiPages = urls.filter((u) => !u.includes("welcome"));
+
+  for (const apiUrl of apiPages) {
+    console.log(`[discover:nested] checking sub-pages on ${apiUrl.split("/").pop()}`);
+    try {
+      await page.goto(apiUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      await sleep(2500);
+      await expandEverything(page);
+      await sleep(500);
+      await expandEverything(page);
+      await sleep(500);
+
+      // Find all clickable sidebar items inside Stoplight Elements or API tree
+      const subItemCount = await page.evaluate(() => {
+        const selectors = [
+          '.sl-elements a[href]',
+          '.sl-elements-api a[href]',
+          '[data-testid="two-column-left"] a[href]',
+          'nav a[href]',
+          'aside a[href]',
+          '[role="navigation"] a[href]',
+          '[role="treeitem"] a[href]',
+          '[role="menuitem"] a[href]',
+        ];
+        const found = new Set();
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach((a) => {
+            const href = a.getAttribute("href");
+            if (href) found.add(href);
+          });
+        }
+        return found.size;
+      });
+
+      // Collect ALL links visible on this page
+      const pageLinks = await page.evaluate((prefix) => {
+        const out = new Set();
+        document.querySelectorAll("a[href]").forEach((a) => {
+          const href = a.getAttribute("href");
+          if (!href) return;
+          try {
+            const abs = new URL(href, window.location.origin).toString().split("#")[0];
+            if (abs.includes(prefix) || abs.includes("/docs/")) out.add(abs);
+          } catch {}
+        });
+        return Array.from(out);
+      }, URL_PREFIX);
+
+      for (const link of pageLinks) {
+        if (!urls.includes(link)) nestedUrls.add(link);
+      }
+
+      // Also try clicking sidebar tree items that may use JS navigation
+      const clickableItems = await page.$$('[role="treeitem"], [role="menuitem"], .sl-elements [role="button"], .sl-elements-api [role="button"]');
+      for (const item of clickableItems.slice(0, 30)) {
+        try {
+          const currentUrl = page.url();
+          await item.click({ timeout: 2000 });
+          await sleep(800);
+          const newUrl = page.url();
+          if (newUrl !== currentUrl && newUrl.includes("/docs/")) {
+            const clean = newUrl.split("#")[0];
+            if (!urls.includes(clean)) {
+              nestedUrls.add(clean);
+              console.log(`[discover:nested]   found sub-page: ${clean.split("/").pop()}`);
+            }
+          }
+        } catch {}
+      }
+    } catch (err) {
+      console.error(`[discover:nested] error on ${apiUrl}: ${err.message}`);
+    }
+  }
+
+  if (nestedUrls.size > 0) {
+    console.log(`[discover:nested] found ${nestedUrls.size} additional sub-pages`);
+  }
+
+  return [...urls, ...nestedUrls];
 }
 
 async function extractPage(page, url) {
