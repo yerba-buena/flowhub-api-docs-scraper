@@ -8,6 +8,7 @@ import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
 import fs from "node:fs/promises";
 import path from "node:path";
+import yaml from "yaml";
 
 const BASE_URL = "https://flowhub.stoplight.io";
 const START_URL = `${BASE_URL}/docs/public-developer-portal/4b402d5ab3edd-welcome`;
@@ -15,6 +16,7 @@ const URL_PREFIX = "/docs/public-developer-portal/";
 const OUTPUT_DIR = path.resolve(process.env.OUTPUT_DIR || "./output");
 const PAGES_DIR = path.join(OUTPUT_DIR, "pages");
 const SECTIONS_DIR = path.join(OUTPUT_DIR, "sections");
+const SPECS_DIR = path.join(OUTPUT_DIR, "specs");
 
 const DELAY_MS = 600;
 const NAV_TIMEOUT_MS = 45_000;
@@ -272,6 +274,260 @@ function generateDescription(title, markdown) {
   return `Reference for ${title}.`;
 }
 
+// ---------------------------------------------------------------------------
+// Phase: Fetch OpenAPI specs directly from Stoplight's API
+// ---------------------------------------------------------------------------
+
+const OPENAPI_SOURCES = [
+  {
+    url: "https://stoplight.io/api/v1/projects/flowhub/public-developer-portal/nodes/reference/Flowhub%20APIs.oas2.yml?fromExportButton=true&snapshotType=http_service&deref=optimizedBundle",
+    filename: "inventory-api.yaml",
+    summaryFilename: "inventory-api-summary.md",
+    format: "yaml",
+  },
+  {
+    url: "https://stoplight.io/api/v1/projects/flowhub/public-developer-portal/nodes/reference/Order-Ahead.oas2.yml?fromExportButton=true&snapshotType=http_service&deref=optimizedBundle",
+    filename: "order-ahead.yaml",
+    summaryFilename: "order-ahead-summary.md",
+    format: "yaml",
+  },
+  {
+    url: "https://stoplight.io/api/v1/projects/flowhub/public-developer-portal/nodes/reference/update%20access%20token.oas2.yml?fromExportButton=true&snapshotType=http_service&deref=optimizedBundle",
+    filename: "access-token.yaml",
+    summaryFilename: "access-token-summary.md",
+    format: "yaml",
+  },
+  {
+    url: "https://flowhub.stoplight.io/api/v1/projects/cHJqOjkwNTcz/table-of-contents",
+    filename: "table-of-contents.json",
+    format: "json",
+  },
+];
+
+function generateSpecSummary(spec, sourceUrl) {
+  const lines = [];
+
+  // Title and version
+  const title = spec.info?.title ?? "Untitled API";
+  const version = spec.info?.version ?? "unknown";
+  lines.push(`# ${title}`, "");
+  lines.push(`**Version:** ${version}`, "");
+  if (spec.info?.description) {
+    lines.push(`**Description:** ${spec.info.description}`, "");
+  }
+  lines.push(`**Source:** ${sourceUrl}`, "");
+
+  // Base URL
+  if (spec.host || spec.basePath) {
+    const scheme = spec.schemes?.[0] ?? "https";
+    const host = spec.host ?? "unknown";
+    const basePath = spec.basePath ?? "/";
+    lines.push(`**Base URL:** \`${scheme}://${host}${basePath}\``, "");
+  }
+  if (spec.servers && spec.servers.length > 0) {
+    lines.push("**Servers:**", "");
+    for (const server of spec.servers) {
+      lines.push(`- \`${server.url}\`${server.description ? ` — ${server.description}` : ""}`);
+    }
+    lines.push("");
+  }
+
+  // Authentication
+  const securityDefs = spec.securityDefinitions ?? spec.components?.securitySchemes ?? null;
+  if (securityDefs) {
+    lines.push("## Authentication", "");
+    for (const [name, def] of Object.entries(securityDefs)) {
+      const type = def.type ?? "unknown";
+      const inLocation = def.in ? ` (in ${def.in})` : "";
+      const paramName = def.name ? `, parameter: \`${def.name}\`` : "";
+      lines.push(`- **${name}**: type=\`${type}\`${inLocation}${paramName}`);
+      if (def.description) lines.push(`  - ${def.description}`);
+    }
+    lines.push("");
+  }
+
+  // Endpoints
+  const paths = spec.paths ?? {};
+  const pathKeys = Object.keys(paths).sort();
+  if (pathKeys.length > 0) {
+    lines.push("## Endpoints", "");
+    lines.push("| Method | Path | Operation ID | Summary |");
+    lines.push("|--------|------|-------------|---------|");
+
+    const endpointDetails = [];
+
+    for (const pathStr of pathKeys) {
+      const methods = paths[pathStr];
+      for (const method of ["get", "post", "put", "patch", "delete", "options", "head"]) {
+        const op = methods[method];
+        if (!op) continue;
+        const opId = op.operationId ?? "—";
+        const summary = op.summary ?? "—";
+        lines.push(`| \`${method.toUpperCase()}\` | \`${pathStr}\` | \`${opId}\` | ${summary} |`);
+
+        // Collect request body info for POST/PATCH/PUT
+        if (["post", "patch", "put"].includes(method)) {
+          const bodyInfo = extractRequestBody(op, spec);
+          if (bodyInfo) {
+            endpointDetails.push({ method: method.toUpperCase(), path: pathStr, opId, bodyInfo });
+          }
+        }
+      }
+    }
+    lines.push("");
+
+    // Request body details for POST/PATCH/PUT
+    if (endpointDetails.length > 0) {
+      lines.push("## Request Bodies", "");
+      for (const detail of endpointDetails) {
+        lines.push(`### \`${detail.method} ${detail.path}\` (\`${detail.opId}\`)`, "");
+        lines.push(detail.bodyInfo, "");
+      }
+    }
+  }
+
+  // Definitions / Schemas
+  const definitions = spec.definitions ?? spec.components?.schemas ?? {};
+  const defKeys = Object.keys(definitions).sort();
+  if (defKeys.length > 0) {
+    lines.push("## Definitions / Schemas", "");
+    for (const defName of defKeys) {
+      const schema = definitions[defName];
+      lines.push(`### \`${defName}\``, "");
+      if (schema.description) lines.push(`${schema.description}`, "");
+      if (schema.type) lines.push(`**Type:** \`${schema.type}\``, "");
+
+      const props = schema.properties ?? {};
+      const propKeys = Object.keys(props);
+      const required = new Set(schema.required ?? []);
+      if (propKeys.length > 0) {
+        lines.push("| Property | Type | Required | Description |");
+        lines.push("|----------|------|----------|-------------|");
+        for (const prop of propKeys) {
+          const p = props[prop];
+          const type = formatSchemaType(p);
+          const req = required.has(prop) ? "Yes" : "No";
+          const desc = (p.description ?? "—").replace(/\n/g, " ");
+          lines.push(`| \`${prop}\` | \`${type}\` | ${req} | ${desc} |`);
+        }
+        lines.push("");
+      }
+
+      // Handle enum values
+      if (schema.enum) {
+        lines.push(`**Enum values:** ${schema.enum.map((v) => `\`${v}\``).join(", ")}`, "");
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function formatSchemaType(schema) {
+  if (!schema) return "unknown";
+  if (schema.$ref) return schema.$ref.split("/").pop();
+  if (schema.type === "array") {
+    if (schema.items?.$ref) return `array<${schema.items.$ref.split("/").pop()}>`;
+    if (schema.items?.type) return `array<${schema.items.type}>`;
+    return "array";
+  }
+  if (schema.type) {
+    let t = schema.type;
+    if (schema.format) t += `(${schema.format})`;
+    return t;
+  }
+  if (schema.allOf) return "allOf(...)";
+  if (schema.oneOf) return "oneOf(...)";
+  if (schema.anyOf) return "anyOf(...)";
+  return "object";
+}
+
+function extractRequestBody(operation, spec) {
+  const lines = [];
+
+  // Swagger 2.x style: body parameter
+  const bodyParams = (operation.parameters ?? []).filter((p) => p.in === "body");
+  if (bodyParams.length > 0) {
+    for (const bp of bodyParams) {
+      if (bp.schema) {
+        if (bp.schema.$ref) {
+          const refName = bp.schema.$ref.split("/").pop();
+          lines.push(`**Body schema:** [\`${refName}\`](#${refName.toLowerCase()})`);
+        } else {
+          lines.push(`**Body schema:** inline \`${bp.schema.type ?? "object"}\``);
+          const props = bp.schema.properties ?? {};
+          const propKeys = Object.keys(props);
+          const required = new Set(bp.schema.required ?? []);
+          if (propKeys.length > 0) {
+            lines.push("");
+            lines.push("| Property | Type | Required | Description |");
+            lines.push("|----------|------|----------|-------------|");
+            for (const prop of propKeys) {
+              const p = props[prop];
+              const type = formatSchemaType(p);
+              const req = required.has(prop) ? "Yes" : "No";
+              const desc = (p.description ?? "—").replace(/\n/g, " ");
+              lines.push(`| \`${prop}\` | \`${type}\` | ${req} | ${desc} |`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // OpenAPI 3.x style: requestBody
+  if (operation.requestBody) {
+    const content = operation.requestBody.content ?? {};
+    for (const [mediaType, mediaObj] of Object.entries(content)) {
+      lines.push(`**Content-Type:** \`${mediaType}\``);
+      if (mediaObj.schema?.$ref) {
+        const refName = mediaObj.schema.$ref.split("/").pop();
+        lines.push(`**Body schema:** [\`${refName}\`](#${refName.toLowerCase()})`);
+      } else if (mediaObj.schema) {
+        lines.push(`**Body schema:** inline \`${mediaObj.schema.type ?? "object"}\``);
+      }
+    }
+  }
+
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+async function fetchOpenAPISpecs() {
+  console.log("\n[openapi] Fetching OpenAPI specs from Stoplight API...");
+  await fs.mkdir(SPECS_DIR, { recursive: true });
+
+  for (const source of OPENAPI_SOURCES) {
+    const label = source.filename;
+    try {
+      console.log(`[openapi] downloading ${label}...`);
+      const resp = await fetch(source.url);
+      if (!resp.ok) {
+        console.error(`[openapi] FAILED ${label}: HTTP ${resp.status} ${resp.statusText}`);
+        continue;
+      }
+      const text = await resp.text();
+      await fs.writeFile(path.join(SPECS_DIR, source.filename), text, "utf8");
+      console.log(`[openapi] saved ${label} (${text.length.toLocaleString()} chars)`);
+
+      // Generate summary for YAML specs
+      if (source.format === "yaml" && source.summaryFilename) {
+        try {
+          const spec = yaml.parse(text);
+          const summary = generateSpecSummary(spec, source.url);
+          await fs.writeFile(path.join(SPECS_DIR, source.summaryFilename), summary, "utf8");
+          console.log(`[openapi] generated summary: ${source.summaryFilename}`);
+        } catch (parseErr) {
+          console.error(`[openapi] failed to parse/summarize ${label}: ${parseErr.message}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[openapi] FAILED ${label}: ${err.message}`);
+    }
+  }
+
+  console.log("[openapi] OpenAPI spec fetch complete.");
+}
+
 async function main() {
   console.log(`[config] OUTPUT_DIR = ${OUTPUT_DIR}`);
   await fs.mkdir(PAGES_DIR, { recursive: true });
@@ -448,6 +704,14 @@ ${md}
     console.log(`Output: ${OUTPUT_DIR}`);
   } finally {
     await browser.close();
+  }
+
+  // Fetch OpenAPI specs after browser is closed — runs independently so
+  // Playwright scraping results are preserved even if this phase fails.
+  try {
+    await fetchOpenAPISpecs();
+  } catch (err) {
+    console.error("[openapi] OpenAPI spec fetch failed (non-fatal):", err.message);
   }
 }
 
