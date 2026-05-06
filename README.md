@@ -67,6 +67,10 @@ Stoplight Elements lazy-renders schemas and tabs. The scraper sweeps every page 
 
 Tunable via constants at the top of `scrape.js`. See troubleshooting in [DISCLAIMER.md](DISCLAIMER.md) and the doc repo's README.
 
+## Issues
+
+If the scraper misses content, produces broken Markdown, or the generated OpenAPI spec has errors, please [open an issue](https://github.com/yerba-buena/flowhub-api-docs-scraper/issues).
+
 ## License
 
 MIT for the scraper code. The mirrored content in `flowhub-api-docs` belongs to Flowhub.
