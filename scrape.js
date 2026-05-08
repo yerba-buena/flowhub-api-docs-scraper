@@ -25,6 +25,7 @@ const EXPANSION_PASSES = 8;
 const EXPANSION_PASS_DELAY = 350;
 const TAB_DWELL_MS = 250;
 const EXTRA_URLS = [];
+const TOC_URL = "https://flowhub.stoplight.io/api/v1/projects/cHJqOjkwNTcz/table-of-contents";
 
 const CONTENT_SELECTORS = [
   '[data-testid="two-column-left"]',
@@ -127,114 +128,61 @@ async function rotateTabs(page) {
   await expandEverything(page);
 }
 
-async function discoverUrls(page) {
-  console.log(`[discover] loading ${START_URL}`);
-  await page.goto(START_URL, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-  await page.waitForSelector("nav, aside, [role='navigation']", { timeout: CONTENT_TIMEOUT_MS }).catch(() => {});
-  await sleep(2000);
-  await expandEverything(page);
-  await sleep(500);
-  await expandEverything(page);
+async function discoverUrlsFromToc() {
+  console.log("[discover] fetching table of contents from Stoplight API...");
+  const resp = await fetch(TOC_URL);
+  if (!resp.ok) throw new Error(`ToC fetch failed: HTTP ${resp.status}`);
+  const toc = await resp.json();
 
-  // Phase 1: collect all <a href> links pointing to portal pages
-  const urls = await page.evaluate((prefix) => {
-    const out = new Set();
-    document.querySelectorAll("a[href]").forEach((a) => {
-      const href = a.getAttribute("href");
-      if (!href || !href.includes(prefix)) return;
-      try {
-        const abs = new URL(href, window.location.origin).toString().split("#")[0];
-        out.add(abs);
-      } catch {}
-    });
-    return Array.from(out);
-  }, URL_PREFIX);
-  console.log(`[discover] found ${urls.length} top-level sidebar links`);
+  // Map top-level Stoplight service titles to our section filenames
+  const SERVICE_SECTIONS = {
+    "Welcome": "00-overview",
+    "Inventory": "06-inventory",
+    "Orders": "04-orders",
+    "Order Ahead": "04-orders",
+    "Order-Ahead Bearer Token": "01-authentication",
+  };
 
-  // Phase 2: visit each API page and discover nested sub-page links
-  // Stoplight Elements renders endpoint sidebars with clickable items
-  // that use client-side navigation — we need to click each one and
-  // capture the resulting URL from the address bar.
-  const nestedUrls = new Set();
-  const apiPages = urls.filter((u) => !u.includes("welcome"));
+  const results = [];
 
-  for (const apiUrl of apiPages) {
-    console.log(`[discover:nested] checking sub-pages on ${apiUrl.split("/").pop()}`);
-    try {
-      await page.goto(apiUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
-      await sleep(2500);
-      await expandEverything(page);
-      await sleep(500);
-      await expandEverything(page);
-      await sleep(500);
-
-      // Find all clickable sidebar items inside Stoplight Elements or API tree
-      const subItemCount = await page.evaluate(() => {
-        const selectors = [
-          '.sl-elements a[href]',
-          '.sl-elements-api a[href]',
-          '[data-testid="two-column-left"] a[href]',
-          'nav a[href]',
-          'aside a[href]',
-          '[role="navigation"] a[href]',
-          '[role="treeitem"] a[href]',
-          '[role="menuitem"] a[href]',
-        ];
-        const found = new Set();
-        for (const sel of selectors) {
-          document.querySelectorAll(sel).forEach((a) => {
-            const href = a.getAttribute("href");
-            if (href) found.add(href);
-          });
-        }
-        return found.size;
-      });
-
-      // Collect ALL links visible on this page
-      const pageLinks = await page.evaluate((prefix) => {
-        const out = new Set();
-        document.querySelectorAll("a[href]").forEach((a) => {
-          const href = a.getAttribute("href");
-          if (!href) return;
-          try {
-            const abs = new URL(href, window.location.origin).toString().split("#")[0];
-            if (abs.includes(prefix) || abs.includes("/docs/")) out.add(abs);
-          } catch {}
+  function processItems(items, section, groupName) {
+    for (const item of items) {
+      if (item.slug) {
+        let itemSection = section;
+        // The "Locations" group under Inventory gets its own section
+        if (/^locations$/i.test(groupName)) itemSection = "03-locations";
+        results.push({
+          url: `${BASE_URL}/docs/public-developer-portal/${item.slug}`,
+          slug: item.slug,
+          section: itemSection,
+          type: item.type || "unknown",
+          title: item.title || item.slug,
         });
-        return Array.from(out);
-      }, URL_PREFIX);
-
-      for (const link of pageLinks) {
-        if (!urls.includes(link)) nestedUrls.add(link);
       }
-
-      // Also try clicking sidebar tree items that may use JS navigation
-      const clickableItems = await page.$$('[role="treeitem"], [role="menuitem"], .sl-elements [role="button"], .sl-elements-api [role="button"]');
-      for (const item of clickableItems.slice(0, 30)) {
-        try {
-          const currentUrl = page.url();
-          await item.click({ timeout: 2000 });
-          await sleep(800);
-          const newUrl = page.url();
-          if (newUrl !== currentUrl && newUrl.includes("/docs/")) {
-            const clean = newUrl.split("#")[0];
-            if (!urls.includes(clean)) {
-              nestedUrls.add(clean);
-              console.log(`[discover:nested]   found sub-page: ${clean.split("/").pop()}`);
-            }
-          }
-        } catch {}
+      if (item.items) {
+        processItems(item.items, section, item.title || groupName);
       }
-    } catch (err) {
-      console.error(`[discover:nested] error on ${apiUrl}: ${err.message}`);
     }
   }
 
-  if (nestedUrls.size > 0) {
-    console.log(`[discover:nested] found ${nestedUrls.size} additional sub-pages`);
+  for (const topItem of toc.items || []) {
+    const section = SERVICE_SECTIONS[topItem.title] ?? inferSection(topItem.title || "", topItem.slug || "");
+    if (topItem.slug) {
+      results.push({
+        url: `${BASE_URL}/docs/public-developer-portal/${topItem.slug}`,
+        slug: topItem.slug,
+        section,
+        type: topItem.type || "http_service",
+        title: topItem.title || topItem.slug,
+      });
+    }
+    if (topItem.items) {
+      processItems(topItem.items, section, null);
+    }
   }
 
-  return [...urls, ...nestedUrls];
+  console.log(`[discover] found ${results.length} pages from table of contents`);
+  return results;
 }
 
 async function extractPage(page, url) {
@@ -295,6 +243,12 @@ const OPENAPI_SOURCES = [
     url: "https://stoplight.io/api/v1/projects/flowhub/public-developer-portal/nodes/reference/update%20access%20token.oas2.yml?fromExportButton=true&snapshotType=http_service&deref=optimizedBundle",
     filename: "access-token.yaml",
     summaryFilename: "access-token-summary.md",
+    format: "yaml",
+  },
+  {
+    url: "https://stoplight.io/api/v1/projects/flowhub/public-developer-portal/nodes/reference/orders.oas2.yml?fromExportButton=true&snapshotType=http_service&deref=optimizedBundle",
+    filename: "orders-api.yaml",
+    summaryFilename: "orders-api-summary.md",
     format: "yaml",
   },
   {
@@ -542,8 +496,9 @@ async function main() {
   const td = setupTurndown();
 
   try {
-    const discovered = await discoverUrls(page);
-    const allUrls = Array.from(new Set([START_URL, ...discovered, ...EXTRA_URLS]));
+    const tocPages = await discoverUrlsFromToc();
+    const slugMeta = new Map(tocPages.map((p) => [p.slug, p]));
+    const allUrls = tocPages.map((p) => p.url);
     console.log(`[plan] ${allUrls.length} pages to scrape`);
     const records = [];
 
@@ -554,7 +509,7 @@ async function main() {
       try {
         const { html, title, usedSelector, textLength } = await extractPage(page, url);
         const md = td.turndown(html).trim();
-        const section = inferSection(title, url);
+        const section = slugMeta.get(slug)?.section ?? inferSection(title, url);
         const description = generateDescription(title, md);
         const frontmatter = `---
 title: ${JSON.stringify(title)}
